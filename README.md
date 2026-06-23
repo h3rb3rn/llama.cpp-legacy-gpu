@@ -1,4 +1,16 @@
-# llama.cpp
+# llama.cpp — legacy-gpu-support fork
+
+> **This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)** with patches for
+> heterogeneous multi-GPU inference on pools combining legacy Tesla M10/M60 (CC 5.0/5.2) with modern RTX GPUs.
+>
+> **Modified file:** `common/fit.cpp` — greedy fill, bandwidth-weighted budgets, VRAM-weighted fallback.  
+> **Used by:** [h3rb3rn/ollama-legacy-gpu](https://github.com/h3rb3rn/ollama-legacy-gpu)
+>
+> See [README-LEGACY-GPU.md](README-LEGACY-GPU.md) for full documentation of the patches.
+
+---
+
+# llama.cpp (upstream)
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
