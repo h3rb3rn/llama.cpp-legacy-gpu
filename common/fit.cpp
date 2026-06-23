@@ -195,6 +195,123 @@ static void common_params_fit_impl(
     const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
     const size_t nd = devs.size(); // number of devices
 
+    // ── Legacy-GPU greedy fill (OLLAMA_FORCE_GPU_LAYERS) ─────────────────────
+    // When set to a positive integer, bypasses the conservative fitting algorithm
+    // and fills GPUs greedily from highest CUDA index (best bandwidth) downward.
+    // Intended for multi-GPU pools with heterogeneous GPUs (RTX+Tesla) where the
+    // standard algorithm distributes too conservatively across slow Tesla GPUs.
+    //
+    // Budget scaling (OLLAMA_GPU_BANDWIDTHS / OLLAMA_GPU_MAX_BANDWIDTH):
+    //   effective_budget[i] = raw_budget[i] / (max_bw / bw[i])
+    //   Slow GPUs (Tesla M10: 83 GB/s) get proportionally fewer layers than their
+    //   VRAM allows, preventing them from becoming pipeline bottlenecks.
+    {
+        const char * _force = std::getenv("OLLAMA_FORCE_GPU_LAYERS");
+        if (_force && _force[0] && std::atoi(_force) > 0) {
+            // Compute total model size from dmds_full measurements
+            int64_t _sum_model_bytes = 0;
+            for (size_t _id = 0; _id < nd; _id++) {
+                _sum_model_bytes += dmds_full[_id].mb.model;
+            }
+            // Adaptive overhead scale: fixed compute overhead per GPU / total model weight
+            float _overhead_mb_per_gpu = 1536.0f;
+            if (const char * _o = std::getenv("OLLAMA_OVERHEAD_PER_GPU_MB")) {
+                float _v = std::stof(_o);
+                if (_v > 0 && _v < 10240) _overhead_mb_per_gpu = _v;
+            }
+            float _adaptive_scale = 1.0f + (_overhead_mb_per_gpu * nd) /
+                                    ((_sum_model_bytes > 0 ? _sum_model_bytes : 1) / (1024.0f * 1024.0f));
+            _adaptive_scale = std::max(1.05f, std::min(2.0f, _adaptive_scale));
+            float _ovhd = _adaptive_scale;
+            if (const char * _s = std::getenv("OLLAMA_LAYER_OVERHEAD_SCALE")) {
+                float _v = std::stof(_s);
+                if (_v > 1.0f && _v < 5.0f) _ovhd = _v;
+            }
+            float _bytes_per_layer = (_sum_model_bytes > 0 && hp_ngl > 0) ?
+                ((float)_sum_model_bytes / hp_ngl) * _ovhd :
+                600.0f * 1024 * 1024 * _ovhd;
+
+            // Parse per-GPU bandwidth factors for budget scaling
+            float _bw_factors[64];
+            for (size_t _id = 0; _id < nd && _id < 64; _id++) _bw_factors[_id] = 1.0f;
+            if (const char * _bws_env = std::getenv("OLLAMA_GPU_BANDWIDTHS")) {
+                float _max_bw = 360.0f;
+                if (const char * _mb = std::getenv("OLLAMA_GPU_MAX_BANDWIDTH")) _max_bw = std::stof(_mb);
+                std::string _bws(_bws_env);
+                size_t _bi = 0, _pos = 0;
+                while (_bi < nd && _bi < 64) {
+                    size_t _c = _bws.find(',', _pos);
+                    float _bw = std::stof(_bws.substr(_pos, _c == std::string::npos ? std::string::npos : _c - _pos));
+                    _bw_factors[_bi++] = (_bw > 0) ? (_max_bw / _bw) : 1.0f;
+                    if (_c == std::string::npos) break;
+                    _pos = _c + 1;
+                }
+            }
+
+            // Zero all tensor_split entries before greedy loop
+            if (tensor_split) {
+                for (size_t _id = 0; _id < nd; _id++) tensor_split[_id] = 0.0f;
+            }
+
+            // Greedy fill: best GPU (highest CUDA index = best bandwidth) first
+            uint32_t _layers_left = hp_ngl + 1;
+            uint32_t _total_layers = 0;
+            for (int _id = (int)nd - 1; _id >= 0 && _layers_left > 0; _id--) {
+                int64_t _raw_budget = dmds_full[_id].free - (int64_t)margins_s[_id];
+                // Bandwidth scaling: slow GPUs get proportionally fewer layers
+                int64_t _budget = (_raw_budget > 0) ?
+                    (int64_t)((float)_raw_budget / _bw_factors[_id]) : 0;
+                uint32_t _n = (_budget > 0) ?
+                    std::min(_layers_left, (uint32_t)((float)_budget / _bytes_per_layer)) : 0;
+                if (tensor_split) tensor_split[_id] = (float)_n;
+                _layers_left -= _n;
+                _total_layers += _n;
+            }
+
+            // Fallback: if greedy couldn't place all layers, use VRAM-weighted distribution
+            if (_total_layers < (uint32_t)(hp_ngl + 1)) {
+                float _total_budget = 0.0f;
+                for (size_t _id = 0; _id < nd; _id++) {
+                    float _b = (float)(dmds_full[_id].free) - (float)margins_s[_id];
+                    if (_b > 0) _total_budget += _b;
+                }
+                LOG_WRN("%s: greedy fill placed only %d/%d layers (scale=%.2fx); "
+                        "falling back to VRAM-weighted distribution across %zu GPU(s)\n",
+                        __func__, _total_layers, hp_ngl + 1, _ovhd, nd);
+                mparams->n_gpu_layers = hp_ngl + 1;
+                if (nd > 1 && tensor_split && _total_budget > 0) {
+                    for (size_t _id = 0; _id < nd; _id++) {
+                        float _b = (float)(dmds_full[_id].free) - (float)margins_s[_id];
+                        tensor_split[_id] = (_b > 0) ? (_b / _total_budget) : 0.0f;
+                    }
+                    mparams->tensor_split = tensor_split;
+                }
+                tensor_buft_overrides[0] = {nullptr, nullptr};
+                mparams->tensor_buft_overrides = tensor_buft_overrides;
+                return;
+            }
+
+            // Count GPUs actually used
+            size_t _gpus_used = 0;
+            if (tensor_split) {
+                for (size_t _id = 0; _id < nd; _id++) if (tensor_split[_id] > 0) _gpus_used++;
+            }
+            LOG_INF("%s: OLLAMA_FORCE_GPU_LAYERS=%s → greedy fill: %d/%d layers on %zu/%zu GPU(s), "
+                    "%.0f MB/layer (overhead=%.1fx)\n",
+                    __func__, _force, _total_layers, hp_ngl + 1, _gpus_used, nd,
+                    _bytes_per_layer / 1024 / 1024, _ovhd);
+            mparams->n_gpu_layers = _total_layers;
+            if (nd > 1 && tensor_split) mparams->tensor_split = tensor_split;
+            if (tensor_buft_overrides) {
+                tensor_buft_overrides[0].pattern = nullptr;
+                tensor_buft_overrides[0].buft    = nullptr;
+                mparams->tensor_buft_overrides    = tensor_buft_overrides;
+            }
+            return;
+        }
+    }
+    // ── End legacy-GPU greedy fill ─────────────────────────────────────────
+
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
     if (nd == 0) {
@@ -279,8 +396,14 @@ static void common_params_fit_impl(
                 }
             }
             if (!changes_needed) {
-                LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
-                return;
+                // OLLAMA_GPU_TIER_THRESHOLD: if set, skip early return so tier-aware
+                // layer zeroing (below) can still run even when targets are already met.
+                const char * _tf_env = std::getenv("OLLAMA_GPU_TIER_THRESHOLD");
+                if (!_tf_env || std::atoi(_tf_env) <= 0) {
+                    LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
+                    return;
+                }
+                LOG_TRC("%s: targets met but OLLAMA_GPU_TIER_THRESHOLD set — continuing for tier-aware fill\n", __func__);
             }
         }
     }
