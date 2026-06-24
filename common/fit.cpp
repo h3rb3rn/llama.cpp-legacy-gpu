@@ -268,24 +268,34 @@ static void common_params_fit_impl(
                 _total_layers += _n;
             }
 
-            // Fallback: if greedy couldn't place all layers, use VRAM-weighted distribution
+            // Partial-fill fallback: keep the layers greedy already placed, then distribute
+            // the remaining layers by raw VRAM (no bandwidth weighting) so overflow goes to
+            // any GPU that still has physical space — even a slow one.
+            //
+            // Previous behaviour (full VRAM-weighted reset) discarded the greedy placement
+            // and gave every GPU a proportional slice, wasting the bandwidth-priority ordering.
+            // Example for llama4:scout (44/49 placed): RTX 3060 had 9 layers from greedy;
+            // with the old fallback it dropped back to ~6.5 GiB — leaving 5.5 GiB idle.
+            // With partial fill it keeps its 9 layers and only Tesla/GTX absorb the 5 overflow.
             if (_total_layers < (uint32_t)(hp_ngl + 1)) {
-                float _total_budget = 0.0f;
+                uint32_t _overflow = (uint32_t)(hp_ngl + 1) - _total_layers;
+                float _total_raw = 0.0f;
                 for (size_t _id = 0; _id < nd; _id++) {
                     float _b = (float)(dmds_full[_id].free) - (float)margins_s[_id];
-                    if (_b > 0) _total_budget += _b;
+                    if (_b > 0) _total_raw += _b;
                 }
-                LOG_WRN("%s: greedy fill placed only %d/%d layers (scale=%.2fx); "
-                        "falling back to VRAM-weighted distribution across %zu GPU(s)\n",
-                        __func__, _total_layers, hp_ngl + 1, _ovhd, nd);
-                mparams->n_gpu_layers = hp_ngl + 1;
-                if (nd > 1 && tensor_split && _total_budget > 0) {
+                LOG_WRN("%s: greedy fill placed only %d/%d layers (overhead=%.2fx too tight); "
+                        "distributing %d overflow layer(s) by raw VRAM across %zu GPU(s)\n",
+                        __func__, _total_layers, hp_ngl + 1, _ovhd, _overflow, nd);
+                // Add overflow proportional to raw VRAM — preserves the greedy placement.
+                if (nd > 1 && tensor_split && _total_raw > 0) {
                     for (size_t _id = 0; _id < nd; _id++) {
                         float _b = (float)(dmds_full[_id].free) - (float)margins_s[_id];
-                        tensor_split[_id] = (_b > 0) ? (_b / _total_budget) : 0.0f;
+                        if (_b > 0) tensor_split[_id] += (_b / _total_raw) * (float)_overflow;
                     }
                     mparams->tensor_split = tensor_split;
                 }
+                mparams->n_gpu_layers = hp_ngl + 1;
                 tensor_buft_overrides[0] = {nullptr, nullptr};
                 mparams->tensor_buft_overrides = tensor_buft_overrides;
                 return;
