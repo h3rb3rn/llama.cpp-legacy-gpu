@@ -1,0 +1,10 @@
+# Dependabot disabled for this fork.
+#
+# All dependency alerts stem from upstream ggml-org/llama.cpp benchmark,
+# conversion, and UI tool requirements that are not built or deployed
+# in h3rb3rn/ollama-legacy-gpu. The custom build only uses the C++ core
+# (common/fit.cpp, ggml-cuda/) — no Python or npm packages are installed.
+#
+# To re-enable scanning: remove this file or add package-ecosystem entries.
+version: 2
+updates: []
