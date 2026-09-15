@@ -1237,6 +1237,7 @@ const func_builtins & value_none_t::get_builtins() const {
 const func_builtins & value_undefined_t::get_builtins() const {
     static const func_builtins builtins = {
         {"default", default_value},
+        {"tojson", tojson},
         {"capitalize", empty_value_fn<value_string>},
         {"first", empty_value_fn<value_undefined>},
         {"items", empty_value_fn<value_array>},
