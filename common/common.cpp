@@ -1201,6 +1201,32 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.fit_params) {
         LOG_INF("%s: fitting params to device memory ...\n", __func__);
         LOG_INF("%s: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n", __func__);
+
+        // CLIP/vision compute-buffer margin (see BUG-hybrid-arch-degeneration.md,
+        // Finding 1, in the parent ollama-legacy-gpu repo): the fitting probe below
+        // only ever constructs a text-only llama_context, so it has zero visibility
+        // into the vision/CLIP tower's compute buffer, which mtmd reserves
+        // separately, unconditionally, and independent of context length once it
+        // initializes. On small-VRAM legacy GPUs (e.g. an 8 GiB Tesla M10) that
+        // buffer alone can exceed the probe's entire estimated surplus, so the
+        // probe commits to a layer count that later collides with the real
+        // reservation and collapses to near-zero GPU layers. Empirically observed
+        // on Tesla M10 this session: ~4.6-4.7 GiB, consistently on device 0
+        // regardless of --main-gpu (CLIP does not appear to respect main_gpu
+        // placement) — re-verify this constant/placement assumption against newer
+        // vision models or a future mtmd/clip change, it is a padded empirical
+        // estimate (from two observed samples: 4628 MiB, 4657 MiB), not a computed
+        // exact value. A more precise fix would query mtmd's own compute-buffer
+        // estimate directly; this fixed margin is the fast, low-risk first step.
+        if (!params.mmproj.path.empty() && !params.no_mmproj && params.mmproj_use_gpu
+                && !params.fit_params_target.empty()) {
+            constexpr size_t CLIP_COMPUTE_BUFFER_MARGIN = 4864ull * 1024 * 1024; // ~4.75 GiB
+            params.fit_params_target[0] += CLIP_COMPUTE_BUFFER_MARGIN;
+            LOG_INF("%s: vision model detected (mmproj set) - reserving an extra %zu MiB "
+                    "on device 0 for the CLIP compute buffer before fitting\n",
+                    __func__, CLIP_COMPUTE_BUFFER_MARGIN / (1024 * 1024));
+        }
+
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
